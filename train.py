@@ -30,6 +30,11 @@ def train_one_epoch(model, dataloader, optimizer, scaler, l1_criterion, ssim_cri
             loss = alpha * l1_loss + beta * ssim_loss_val
             
         scaler.scale(loss).backward()
+        
+        # Gradient Clipping per stabilizzare l'addestramento
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         scaler.step(optimizer)
         scaler.update()
         
