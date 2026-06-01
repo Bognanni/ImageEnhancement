@@ -1,126 +1,168 @@
 import os
+import argparse
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
-from piq import ssim, psnr, brisque, SSIMLoss
+from piq import psnr, ssim, SSIMLoss
+import torch.backends.cudnn as cudnn
 
 from dataset import get_dataloaders
 from model import AttentionUNet, CompactUNet
 
-def train_one_epoch(model, dataloader, optimizer, scaler, l1_criterion, ssim_criterion, device, alpha=1.0, beta=1.0):
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train Low-Light Enhancement Model")
+    parser.add_argument('--model', type=str, default='compact', choices=['compact', 'attention'],
+                        help="Scegli quale architettura addestrare")
+    parser.add_argument('--batch_size', type=int, default=4,
+                        help="Batch size fisico in VRAM (consigliato 4 per RTX 2000 Ada a 256x256)")
+    parser.add_argument('--accum_steps', type=int, default=4,
+                        help="Step di Gradient Accumulation (batch virtuale = batch_size * accum_steps)")
+    parser.add_argument('--epochs', type=int, default=100, help="Numero massimo di epoche")
+    parser.add_argument('--lr', type=float, default=1e-4, help="Learning rate iniziale")
+    return parser.parse_args()
+
+
+def train_one_epoch(model, dataloader, optimizer, scaler, l1_criterion, ssim_criterion, device, accum_steps, alpha=1.0,
+                    beta=1.0):
     model.train()
     running_loss = 0.0
-    
+
     pbar = tqdm(dataloader, desc='Training')
-    for low, high in pbar:
+    optimizer.zero_grad()  # Resetta i gradienti all'inizio dell'epoca
+
+    for i, (low, high) in enumerate(pbar):
         low, high = low.to(device), high.to(device)
-        
-        optimizer.zero_grad()
-        
-        # Mixed precision
+
+        # Mixed precision per massimizzare la velocità sui Tensor Cores
         with autocast('cuda'):
             output = model(low)
+
             l1_loss = l1_criterion(output, high)
-            # SSIM loss requires float32
+            # SSIM loss richiede i tensori in float32 per stabilità numerica
             ssim_loss_val = ssim_criterion(output.float(), high.float())
-            
-            loss = alpha * l1_loss + beta * ssim_loss_val
-            
+
+            # Combinazione delle loss. Dividiamo per accum_steps per
+            # mantenere la magnitudo del gradiente costante.
+            loss = (alpha * l1_loss + beta * ssim_loss_val) / accum_steps
+
+        # Accumulo dei gradienti
         scaler.scale(loss).backward()
-        
-        # Gradient Clipping per stabilizzare l'addestramento
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        scaler.step(optimizer)
-        scaler.update()
-        
-        running_loss += loss.item()
-        pbar.set_postfix({'loss': loss.item()})
-        
+
+        # Eseguiamo lo step di ottimizzazione solo ogni 'accum_steps' iterazioni
+        # o se siamo all'ultimo batch del dataloader
+        if ((i + 1) % accum_steps == 0) or ((i + 1) == len(dataloader)):
+            # Gradient Clipping per stabilità estrema (utile con l'Attenzione)
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()  # Resetta i gradienti per il prossimo ciclo di accumulo
+
+        # Ricalcoliamo la loss in scala reale solo per i log visivi
+        real_loss = loss.item() * accum_steps
+        running_loss += real_loss
+        pbar.set_postfix({'loss': f"{real_loss:.4f}"})
+
     return running_loss / len(dataloader)
+
 
 @torch.no_grad()
 def validate(model, dataloader, device):
     model.eval()
     val_psnr = 0.0
     val_ssim = 0.0
-    
-    pbar = tqdm(dataloader, desc='Validation (LOL-v1)')
+
+    pbar = tqdm(dataloader, desc='Validation (In-Domain LOL-v2)')
     for low, high in pbar:
         low, high = low.to(device), high.to(device)
-        
+
         with autocast('cuda'):
             output = model(low)
-        
-        # Calculate metrics (cast back to float32 for piq)
-        output = output.float()
+
+        # Metriche full-reference calcolate in fp32
+        output = output.float().clamp(0, 1)  # Assicura il range per il calcolo metriche
         high = high.float()
-        
+
         val_psnr += psnr(output, high).item()
         val_ssim += ssim(output, high).item()
-        
+
     return val_psnr / len(dataloader), val_ssim / len(dataloader)
 
+
 def main():
-    # Hyperparameters
-    batch_size = 8
-    epochs = 80
-    lr = 1e-4
-    patience = 15
+    args = parse_args()
+
+    # Ottimizzazioni per GPU architettura Ada Lovelace
+    cudnn.benchmark = True
+    torch.set_float32_matmul_precision('high')
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Dataloaders (We only need train and val for training loop)
-    train_loader, val_loader, _, _, _ = get_dataloaders(batch_size=batch_size)
-    
-    # Model
-    model = AttentionUNet().to(device)
-    # To run baseline, you would use:
-    # model = CompactUNet().to(device)
-    
-    # Optimizer and Loss
-    optimizer = AdamW(model.parameters(), lr=lr)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    print(
+        f"Device: {device} | Modello: {args.model.upper()} | Batch Reale: {args.batch_size} | Virtual Batch: {args.batch_size * args.accum_steps}")
+
+    # Dataloaders - Usiamo 4 workers per non saturare la CPU di Runpod
+    train_loader, val_loader, _, _, _ = get_dataloaders(batch_size=args.batch_size, num_workers=4)
+
+    # Selezione del modello via argparse
+    if args.model == 'attention':
+        model = AttentionUNet().to(device)
+    else:
+        model = CompactUNet().to(device)
+
+    # Optimizer e Scheduler (AdamW è superiore ad Adam per la convergenza con GroupNorm)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     scaler = GradScaler('cuda')
+
+    # Loss functions come da specifiche dell'assignment (L1 + SSIM)
     l1_criterion = nn.L1Loss()
-    ssim_criterion = SSIMLoss() # PIQ's SSIM loss computes 1 - SSIM
-    
+    ssim_criterion = SSIMLoss()
+
+    # Variabili per l'Early Stopping
     best_psnr = 0.0
+    patience = 15
     patience_counter = 0
-    
+    save_path = f'checkpoints/best_model_{args.model}.pth'
+
     os.makedirs('checkpoints', exist_ok=True)
-    
-    for epoch in range(epochs):
-        print(f"\nEpoch {epoch+1}/{epochs}")
-        
-        train_loss = train_one_epoch(model, train_loader, optimizer, scaler, l1_criterion, ssim_criterion, device)
-        print(f"Train Loss: {train_loss:.4f} (LR: {scheduler.get_last_lr()[0]:.6f})")
-        
-        # Step learning rate scheduler
+
+    for epoch in range(args.epochs):
+        print(f"\nEpoch {epoch + 1}/{args.epochs}")
+
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, scaler,
+            l1_criterion, ssim_criterion, device, args.accum_steps
+        )
+        print(f"Train Loss: {train_loss:.4f} (LR: {scheduler.get_last_lr()[0]:.6e})")
+
         scheduler.step()
-        
+
+        # Validazione in-domain
         val_psnr, val_ssim = validate(model, val_loader, device)
-        print(f"Validation (In-Domain) PSNR: {val_psnr:.4f}, SSIM: {val_ssim:.4f}")
-        
-        # Early Stopping check
+        print(f"Val PSNR: {val_psnr:.4f} | Val SSIM: {val_ssim:.4f}")
+
+        # Logica Early Stopping
         if val_psnr > best_psnr:
             best_psnr = val_psnr
             patience_counter = 0
-            torch.save(model.state_dict(), 'checkpoints/best_model.pth')
-            print(f"New best model saved with PSNR: {best_psnr:.4f}")
+            torch.save(model.state_dict(), save_path)
+            print(f"-> Nuovo best model salvato! (PSNR: {best_psnr:.4f})")
         else:
             patience_counter += 1
-            print(f"Early stopping patience: {patience_counter}/{patience}")
-            
+            print(f"-> Nessun miglioramento. Patience: {patience_counter}/{patience}")
+
         if patience_counter >= patience:
-            print("Early stopping triggered!")
+            print("\n*** Early Stopping innescato! Termine dell'addestramento. ***")
             break
-            
-    print("\nTraining completato! Per eseguire il test usa: python evaluation.py")
+
+    print(f"\nAddestramento {args.model.upper()} completato!")
+    print(f"Per testarlo, avvia: python evaluation.py --model {args.model}")
+
 
 if __name__ == '__main__':
     main()
