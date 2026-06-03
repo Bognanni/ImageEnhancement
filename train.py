@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.amp import autocast
 from tqdm import tqdm
 from piq import psnr, ssim, SSIMLoss
 import torch.backends.cudnn as cudnn
@@ -20,8 +21,7 @@ def parse_args():
                         help="Scegli quale architettura addestrare")
     parser.add_argument('--batch_size', type=int, default=4,
                         help="Batch size fisico in VRAM (consigliato 4 per RTX 2000 Ada a 256x256)")
-    parser.add_argument('--accum_steps', type=int, default=1,
-                        help="Step di Gradient Accumulation (batch virtuale = batch_size * accum_steps)")
+
     parser.add_argument('--epochs', type=int, default=100, help="Numero massimo di epoche")
     parser.add_argument('--lr', type=float, default=3e-4, help="Learning rate iniziale")
     return parser.parse_args()
@@ -37,7 +37,7 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
 
 
-def train_one_epoch(model, dataloader, optimizer, l1_criterion, ssim_criterion, device, accum_steps, alpha=1.0,
+def train_one_epoch(model, dataloader, optimizer, l1_criterion, ssim_criterion, device, alpha=1.0,
                     beta=0.1):
     model.train()
     running_loss = 0.0
@@ -48,32 +48,30 @@ def train_one_epoch(model, dataloader, optimizer, l1_criterion, ssim_criterion, 
     for i, (low, high) in enumerate(pbar):
         low, high = low.to(device), high.to(device)
 
-        # Esecuzione standard in Float32 (TF32)
-        output = model(low)
+        # Mixed Precision (BFloat16) solo per il forward pass della rete
+        with autocast(device_type='cuda', dtype=torch.bfloat16):
+            output = model(low)
 
+        # Usciamo dall'autocast! Calcoliamo la loss in puro Float32.
+        # BFloat16 distrugge la precisione necessaria per la SSIM Loss.
+        output = output.float()
         l1_loss = l1_criterion(output, high)
-        ssim_loss_val = ssim_criterion(output.float(), high.float())
+        ssim_loss_val = ssim_criterion(output, high)
 
-        # Combinazione delle loss. Dividiamo per accum_steps per
-        # mantenere la magnitudo del gradiente costante.
-        loss = (alpha * l1_loss + beta * ssim_loss_val) / accum_steps
+        # Combinazione delle loss
+        loss = alpha * l1_loss + beta * ssim_loss_val
 
-        # Backward standard
+        # Backward standard (GradScaler non è necessario con BFloat16)
         loss.backward()
 
-        # Eseguiamo lo step di ottimizzazione solo ogni 'accum_steps' iterazioni
-        # o se siamo all'ultimo batch del dataloader
-        if ((i + 1) % accum_steps == 0) or ((i + 1) == len(dataloader)):
-            # Gradient Clipping per stabilità estrema
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # Gradient Clipping per stabilità estrema
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            optimizer.step()
-            optimizer.zero_grad()  # Resetta i gradienti per il prossimo ciclo di accumulo
+        optimizer.step()
+        optimizer.zero_grad()
 
-        # Ricalcoliamo la loss in scala reale solo per i log visivi
-        real_loss = loss.item() * accum_steps
-        running_loss += real_loss
-        pbar.set_postfix({'loss': f"{real_loss:.4f}"})
+        running_loss += loss.item()
+        pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
     return running_loss / len(dataloader)
 
@@ -88,7 +86,8 @@ def validate(model, dataloader, device):
     for low, high in pbar:
         low, high = low.to(device), high.to(device)
 
-        output = model(low)
+        with autocast(device_type='cuda', dtype=torch.bfloat16):
+            output = model(low)
 
         # Metriche full-reference calcolate in fp32
         output = output.float().clamp(0, 1)  # Assicura il range per il calcolo metriche
@@ -112,7 +111,7 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(
-        f"Device: {device} | Modello: {args.model.upper()} | Batch Reale: {args.batch_size} | Virtual Batch: {args.batch_size * args.accum_steps}")
+        f"Device: {device} | Modello: {args.model.upper()} | Batch Size: {args.batch_size}")
 
     # Dataloaders - Usiamo 4 workers per non saturare la CPU di Runpod
     train_loader, val_loader, _, _, _ = get_dataloaders(batch_size=args.batch_size, num_workers=4)
@@ -133,7 +132,7 @@ def main():
 
     # Variabili per l'Early Stopping
     best_psnr = 0.0
-    patience = 25
+    patience = 15
     patience_counter = 0
     save_path = f'checkpoints/best_model_{args.model}.pth'
 
@@ -144,7 +143,7 @@ def main():
 
         train_loss = train_one_epoch(
             model, train_loader, optimizer,
-            l1_criterion, ssim_criterion, device, args.accum_steps
+            l1_criterion, ssim_criterion, device
         )
         print(f"Train Loss: {train_loss:.4f} (LR: {scheduler.get_last_lr()[0]:.6e})")
         
