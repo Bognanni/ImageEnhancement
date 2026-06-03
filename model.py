@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class ModernResidualBlock(nn.Module):
     """
     Blocco Residuale ottimizzato per Image Enhancement.
@@ -17,7 +16,7 @@ class ModernResidualBlock(nn.Module):
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(8, mid_channels),
-            nn.GELU(),
+            nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(8, out_channels)
         )
@@ -31,7 +30,7 @@ class ModernResidualBlock(nn.Module):
         else:
             self.shortcut = nn.Identity()
 
-        self.final_act = nn.GELU()
+        self.final_act = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x):
         residual = self.shortcut(x)
@@ -140,9 +139,9 @@ class ChannelAttention(nn.Module):
         reduced_planes = max(in_planes // ratio, 1)
 
         self.fc = nn.Sequential(
-            nn.Conv2d(in_planes, reduced_planes, 1, bias=False),
-            nn.GELU(),
-            nn.Conv2d(reduced_planes, in_planes, 1, bias=False)
+            nn.Conv2d(in_channels=in_planes, out_channels=reduced_planes, kernel_size=1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(in_channels=reduced_planes, out_channels=in_planes, kernel_size=1, bias=False)
         )
         self.sigmoid = nn.Sigmoid()
 

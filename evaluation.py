@@ -147,7 +147,7 @@ def main():
     else:
         model = CompactUNet().to(device)
 
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
     print("Pesi caricati con successo.")
 
     # Setup dati

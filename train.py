@@ -1,10 +1,11 @@
 import os
+import random
+import numpy as np
 import argparse
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 from piq import psnr, ssim, SSIMLoss
 import torch.backends.cudnn as cudnn
@@ -26,7 +27,17 @@ def parse_args():
     return parser.parse_args()
 
 
-def train_one_epoch(model, dataloader, optimizer, scaler, l1_criterion, ssim_criterion, device, accum_steps, alpha=1.0,
+def set_seed(seed=42):
+    """Imposta il seed per la riproducibilità deterministica"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+def train_one_epoch(model, dataloader, optimizer, l1_criterion, ssim_criterion, device, accum_steps, alpha=1.0,
                     beta=0.1):
     model.train()
     running_loss = 0.0
@@ -37,30 +48,26 @@ def train_one_epoch(model, dataloader, optimizer, scaler, l1_criterion, ssim_cri
     for i, (low, high) in enumerate(pbar):
         low, high = low.to(device), high.to(device)
 
-        # Mixed precision per massimizzare la velocità sui Tensor Cores
-        with autocast('cuda'):
-            output = model(low)
+        # Esecuzione standard in Float32 (TF32)
+        output = model(low)
 
-            l1_loss = l1_criterion(output, high)
-            # SSIM loss richiede i tensori in float32 per stabilità numerica
-            ssim_loss_val = ssim_criterion(output.float(), high.float())
+        l1_loss = l1_criterion(output, high)
+        ssim_loss_val = ssim_criterion(output.float(), high.float())
 
-            # Combinazione delle loss. Dividiamo per accum_steps per
-            # mantenere la magnitudo del gradiente costante.
-            loss = (alpha * l1_loss + beta * ssim_loss_val) / accum_steps
+        # Combinazione delle loss. Dividiamo per accum_steps per
+        # mantenere la magnitudo del gradiente costante.
+        loss = (alpha * l1_loss + beta * ssim_loss_val) / accum_steps
 
-        # Accumulo dei gradienti
-        scaler.scale(loss).backward()
+        # Backward standard
+        loss.backward()
 
         # Eseguiamo lo step di ottimizzazione solo ogni 'accum_steps' iterazioni
         # o se siamo all'ultimo batch del dataloader
         if ((i + 1) % accum_steps == 0) or ((i + 1) == len(dataloader)):
-            # Gradient Clipping per stabilità estrema (utile con l'Attenzione)
-            scaler.unscale_(optimizer)
+            # Gradient Clipping per stabilità estrema
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             optimizer.zero_grad()  # Resetta i gradienti per il prossimo ciclo di accumulo
 
         # Ricalcoliamo la loss in scala reale solo per i log visivi
@@ -81,8 +88,7 @@ def validate(model, dataloader, device):
     for low, high in pbar:
         low, high = low.to(device), high.to(device)
 
-        with autocast('cuda'):
-            output = model(low)
+        output = model(low)
 
         # Metriche full-reference calcolate in fp32
         output = output.float().clamp(0, 1)  # Assicura il range per il calcolo metriche
@@ -96,6 +102,9 @@ def validate(model, dataloader, device):
 
 def main():
     args = parse_args()
+    
+    # Imposta il seed per replicare i risultati
+    set_seed(42)
 
     # Ottimizzazioni per GPU architettura Ada Lovelace
     cudnn.benchmark = True
@@ -114,10 +123,9 @@ def main():
     else:
         model = CompactUNet().to(device)
 
-    # Optimizer e Scheduler (AdamW è superiore ad Adam per la convergenza con GroupNorm)
+    # Optimizer e Scheduler
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
-    scaler = GradScaler('cuda')
 
     # Loss functions come da specifiche dell'assignment (L1 + SSIM)
     l1_criterion = nn.L1Loss()
@@ -125,7 +133,7 @@ def main():
 
     # Variabili per l'Early Stopping
     best_psnr = 0.0
-    patience = 15
+    patience = 25
     patience_counter = 0
     save_path = f'checkpoints/best_model_{args.model}.pth'
 
@@ -135,16 +143,15 @@ def main():
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
 
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, scaler,
+            model, train_loader, optimizer,
             l1_criterion, ssim_criterion, device, args.accum_steps
         )
         print(f"Train Loss: {train_loss:.4f} (LR: {scheduler.get_last_lr()[0]:.6e})")
-
-        scheduler.step()
-
+        
         # Validazione in-domain
         val_psnr, val_ssim = validate(model, val_loader, device)
         print(f"Val PSNR: {val_psnr:.4f} | Val SSIM: {val_ssim:.4f}")
+        scheduler.step()
 
         # Logica Early Stopping
         if val_psnr > best_psnr:
