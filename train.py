@@ -19,15 +19,15 @@ def parse_args():
                         help="Scegli quale architettura addestrare")
     parser.add_argument('--batch_size', type=int, default=4,
                         help="Batch size fisico in VRAM (consigliato 4 per RTX 2000 Ada a 256x256)")
-    parser.add_argument('--accum_steps', type=int, default=4,
+    parser.add_argument('--accum_steps', type=int, default=1,
                         help="Step di Gradient Accumulation (batch virtuale = batch_size * accum_steps)")
     parser.add_argument('--epochs', type=int, default=100, help="Numero massimo di epoche")
-    parser.add_argument('--lr', type=float, default=1e-4, help="Learning rate iniziale")
+    parser.add_argument('--lr', type=float, default=3e-4, help="Learning rate iniziale")
     return parser.parse_args()
 
 
 def train_one_epoch(model, dataloader, optimizer, scaler, l1_criterion, ssim_criterion, device, accum_steps, alpha=1.0,
-                    beta=1.0):
+                    beta=0.1):
     model.train()
     running_loss = 0.0
 
