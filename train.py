@@ -17,18 +17,18 @@ from model import AttentionUNet, CompactUNet
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Low-Light Enhancement Model")
-    parser.add_argument('--model', type=str, default='compact', choices=['compact', 'attention'],
-                        help="Scegli quale architettura addestrare")
-    parser.add_argument('--batch_size', type=int, default=4,
-                        help="Batch size fisico in VRAM (consigliato 4 per RTX 2000 Ada a 256x256)")
+    parser.add_argument('--model', type=str, default='compact', choices=['compact', 'attention'])
+    parser.add_argument('--batch_size', type=int, default=4)
 
-    parser.add_argument('--epochs', type=int, default=100, help="Numero massimo di epoche")
-    parser.add_argument('--lr', type=float, default=3e-4, help="Learning rate iniziale")
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--lr', type=float, default=3e-4)
     return parser.parse_args()
 
 
 def set_seed(seed=42):
-    """Imposta il seed per la riproducibilità deterministica"""
+    """
+    Set the random seed for reproducibility across various libraries and ensure deterministic behavior in cuDNN.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -37,38 +37,40 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
 
 
-def train_one_epoch(model, dataloader, optimizer, l1_criterion, ssim_criterion, device, alpha=1.0,
-                    beta=0.1):
+def train_one_epoch(model, dataloader, optimizer, l1_criterion, ssim_criterion, device, alpha=1.0, beta=0.1):
+    """
+    Train the model for one epoch. The loss is a combination of L1 loss and SSIM loss, weighted by alpha 
+    and beta respectively. The training loop uses mixed precision with autocast for better performance 
+    on NVIDIA GPUs. Gradient clipping is applied to prevent exploding gradients, and the progress is 
+    displayed using tqdm with the current loss and learning rate in the postfix.
+    """
     model.train()
     running_loss = 0.0
 
     pbar = tqdm(dataloader, desc='Training')
-    optimizer.zero_grad()  # Resetta i gradienti all'inizio dell'epoca
 
-    for i, (low, high) in enumerate(pbar):
+    for _, (low, high) in enumerate(pbar):
         low, high = low.to(device), high.to(device)
+        optimizer.zero_grad()
 
-        # Mixed Precision (BFloat16) solo per il forward pass della rete
+        # Mixed precision training with autocast to speed up training on NVIDIA GPUs while maintaining numerical stability
         with autocast(device_type='cuda', dtype=torch.bfloat16):
             output = model(low)
 
-        # Usciamo dall'autocast! Calcoliamo la loss in puro Float32.
-        # BFloat16 distrugge la precisione necessaria per la SSIM Loss.
+        # Convert output for loss computation from bfloat16 to float32, which is necessary for accurate 
+        # loss calculation, especially for the SSIM loss which can be sensitive to precision
         output = output.float()
         l1_loss = l1_criterion(output, high)
         ssim_loss_val = ssim_criterion(output, high)
 
-        # Combinazione delle loss
         loss = alpha * l1_loss + beta * ssim_loss_val
 
-        # Backward standard (GradScaler non è necessario con BFloat16)
         loss.backward()
 
-        # Gradient Clipping per stabilità estrema
+        # Gradient clipping to prevent exploding gradients
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         optimizer.step()
-        optimizer.zero_grad()
 
         running_loss += loss.item()
         pbar.set_postfix({'loss': f"{loss.item():.4f}"})
@@ -78,6 +80,12 @@ def train_one_epoch(model, dataloader, optimizer, l1_criterion, ssim_criterion, 
 
 @torch.no_grad()
 def validate(model, dataloader, device):
+    """
+    Validate the model on the validation set. The model is set to evaluation mode, and the PSNR and
+    SSIM metrics are computed for each batch. The outputs are converted to float before computing the 
+    metrics to ensure they are in the correct format. The average PSNR and SSIM values are returned 
+    at the end of the validation loop.
+    """
     model.eval()
     val_psnr = 0.0
     val_ssim = 0.0
@@ -89,9 +97,7 @@ def validate(model, dataloader, device):
         with autocast(device_type='cuda', dtype=torch.bfloat16):
             output = model(low)
 
-        # Metriche full-reference calcolate in fp32
-        output = output.float().clamp(0, 1)  # Assicura il range per il calcolo metriche
-        high = high.float()
+        output = output.float()
 
         val_psnr += psnr(output, high).item()
         val_ssim += ssim(output, high).item()
@@ -101,22 +107,19 @@ def validate(model, dataloader, device):
 
 def main():
     args = parse_args()
-    
-    # Imposta il seed per replicare i risultati
     set_seed(42)
 
-    # Ottimizzazioni per GPU architettura Ada Lovelace
+    # to maximize performance on NVIDIA GPUs, we enable cuDNN benchmark and set the matmul precision 
+    # to high for better performance with bfloat16 tensors. This allows cuDNN to find the best convolution 
+    # algorithms for our specific hardware and model architecture, which can significantly speed up training.
     cudnn.benchmark = True
     torch.set_float32_matmul_precision('high')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(
-        f"Device: {device} | Modello: {args.model.upper()} | Batch Size: {args.batch_size}")
+    print(f"Device: {device} | Model: {args.model.upper()} | Batch Size: {args.batch_size}")
 
-    # Dataloaders - Usiamo 4 workers per non saturare la CPU di Runpod
     train_loader, val_loader, _, _, _ = get_dataloaders(batch_size=args.batch_size, num_workers=4)
 
-    # Selezione del modello via argparse
     if args.model == 'attention':
         model = AttentionUNet().to(device)
     else:
@@ -124,13 +127,14 @@ def main():
 
     # Optimizer e Scheduler
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # The Cosine Annealing learning rate scheduler is used to adjust the learning rate during training. 
+    # It starts with the initial learning rate and gradually decreases it following a cosine curve 
+    # until it reaches a minimum value (eta_min) at the end of the training epochs.
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-    # Loss functions come da specifiche dell'assignment (L1 + SSIM)
     l1_criterion = nn.L1Loss()
     ssim_criterion = SSIMLoss()
 
-    # Variabili per l'Early Stopping
     best_psnr = 0.0
     patience = 15
     patience_counter = 0
@@ -141,33 +145,27 @@ def main():
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
 
-        train_loss = train_one_epoch(
-            model, train_loader, optimizer,
-            l1_criterion, ssim_criterion, device
-        )
+        train_loss = train_one_epoch(model, train_loader, optimizer, l1_criterion, ssim_criterion, device)
         print(f"Train Loss: {train_loss:.4f} (LR: {scheduler.get_last_lr()[0]:.6e})")
         
-        # Validazione in-domain
         val_psnr, val_ssim = validate(model, val_loader, device)
         print(f"Val PSNR: {val_psnr:.4f} | Val SSIM: {val_ssim:.4f}")
         scheduler.step()
 
-        # Logica Early Stopping
         if val_psnr > best_psnr:
             best_psnr = val_psnr
             patience_counter = 0
             torch.save(model.state_dict(), save_path)
-            print(f"-> Nuovo best model salvato! (PSNR: {best_psnr:.4f})")
+            print(f"-> New best model saved! (PSNR: {best_psnr:.4f})")
         else:
             patience_counter += 1
-            print(f"-> Nessun miglioramento. Patience: {patience_counter}/{patience}")
+            print(f"-> No improvement. Patience: {patience_counter}/{patience}")
 
         if patience_counter >= patience:
-            print("\n*** Early Stopping innescato! Termine dell'addestramento. ***")
+            print("\nEarly Stopping! Ending the training.")
             break
 
-    print(f"\nAddestramento {args.model.upper()} completato!")
-    print(f"Per testarlo, avvia: python evaluation.py --model {args.model}")
+    print(f"\nTraining {args.model.upper()} completed!")
 
 
 if __name__ == '__main__':
