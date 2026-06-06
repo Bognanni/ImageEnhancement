@@ -1,8 +1,11 @@
 .vscode
 .venv/
+.idea/
 __pycache__/
 data/
 *.png
 *.md
 *.pdf
 *.zip
+
+.checkpoints/

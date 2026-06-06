@@ -9,7 +9,7 @@ from piq import ssim, psnr, brisque
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 
-from dataset import PairedLowLightDataset, UnpairedDataset, setup_datasets
+from dataset import PairedLowLightDataset, UnpairedDataset
 from model import AttentionUNet, CompactUNet
 
 
@@ -150,7 +150,6 @@ def main():
     print("Weights loaded successfully from:", checkpoint_path)
 
     data_dir = './data'
-    setup_datasets(data_dir)
 
     # Test with the same dataset used for training and validation
     test_in_dataset = PairedLowLightDataset(os.path.join(data_dir, 'LOL_v2'), split='test')
