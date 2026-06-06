@@ -16,6 +16,7 @@ from model import AttentionUNet, CompactUNet
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate Low-Light Enhancement Model")
     parser.add_argument('--model', type=str, required=True, choices=['compact', 'attention'])
+    parser.add_argument('--use_transposed_conv', action='store_true')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_vis', type=int, default=5)
     return parser.parse_args()
@@ -139,10 +140,11 @@ def main():
         print(f"Error: Checkpoint '{checkpoint_path}' not found.")
         return
 
+    bilinear_flag = not args.use_transposed_conv
     if args.model == 'attention':
-        model = AttentionUNet().to(device)
+        model = AttentionUNet(bilinear=bilinear_flag).to(device)
     else:
-        model = CompactUNet().to(device)
+        model = CompactUNet(bilinear=bilinear_flag).to(device)
 
     model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
     print("Weights loaded successfully from:", checkpoint_path)

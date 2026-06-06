@@ -19,7 +19,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train Low-Light Enhancement Model")
     parser.add_argument('--model', type=str, default='compact', choices=['compact', 'attention'])
     parser.add_argument('--batch_size', type=int, default=4)
-
+    parser.add_argument('--use_transposed_conv', action='store_true')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=3e-4)
     return parser.parse_args()
@@ -120,10 +120,11 @@ def main():
 
     train_loader, val_loader, _, _, _ = get_dataloaders(batch_size=args.batch_size, num_workers=4)
 
+    bilinear_flag = not args.use_transposed_conv
     if args.model == 'attention':
-        model = AttentionUNet().to(device)
+        model = AttentionUNet(bilinear=bilinear_flag).to(device)
     else:
-        model = CompactUNet().to(device)
+        model = CompactUNet(bilinear=bilinear_flag).to(device)
 
     # Optimizer e Scheduler
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
