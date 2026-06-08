@@ -20,6 +20,8 @@ def parse_args():
     parser.add_argument('--model', type=str, default='compact', choices=['compact', 'attention'])
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--use_transposed_conv', action='store_true')
+    parser.add_argument('--use_tv_loss', action='store_true', help="Applica la Total Variation Loss per mitigare il rumore e i checkerboard artifacts")
+    parser.add_argument('--tv_weight', type=float, default=0.01, help="Peso applicato alla TV Loss")
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=3e-4)
     return parser.parse_args()
@@ -37,7 +39,16 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
 
 
-def train_one_epoch(model, dataloader, optimizer, l1_criterion, ssim_criterion, device, alpha=1.0, beta=0.1):
+def tv_loss(x):
+    """
+    Computes the Total Variation Loss to encourage spatial smoothness and penalize high-frequency noise/checkerboard artifacts.
+    """
+    h_tv = torch.mean(torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :]))
+    w_tv = torch.mean(torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]))
+    return h_tv + w_tv
+
+
+def train_one_epoch(model, dataloader, optimizer, l1_criterion, ssim_criterion, device, alpha=1.0, beta=0.1, use_tv_loss=False, tv_weight=0.01):
     """
     Train the model for one epoch. The loss is a combination of L1 loss and SSIM loss, weighted by alpha 
     and beta respectively. The training loop uses mixed precision with autocast for better performance 
@@ -64,6 +75,10 @@ def train_one_epoch(model, dataloader, optimizer, l1_criterion, ssim_criterion, 
         ssim_loss_val = ssim_criterion(output, high)
 
         loss = alpha * l1_loss + beta * ssim_loss_val
+
+        if use_tv_loss:
+            tv_val = tv_loss(output)
+            loss += tv_weight * tv_val
 
         loss.backward()
 
@@ -146,7 +161,7 @@ def main():
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
 
-        train_loss = train_one_epoch(model, train_loader, optimizer, l1_criterion, ssim_criterion, device)
+        train_loss = train_one_epoch(model, train_loader, optimizer, l1_criterion, ssim_criterion, device, use_tv_loss=args.use_tv_loss, tv_weight=args.tv_weight)
         print(f"Train Loss: {train_loss:.4f} (LR: {scheduler.get_last_lr()[0]:.6e})")
         
         val_psnr, val_ssim = validate(model, val_loader, device)
