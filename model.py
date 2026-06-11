@@ -231,7 +231,8 @@ class SpatialAttention(nn.Module):
 class CBAM(nn.Module):
     """
     CBAM (Convolutional Block Attention Module) that combines both channel and spatial attention mechanisms 
-    to enhance feature representation in the up-scaling path of the UNet architecture."""
+    to enhance feature representation in the up-scaling path of the UNet architecture.
+    """
 
     def __init__(self, in_planes, ratio=16, kernel_size=7):
         super(CBAM, self).__init__()

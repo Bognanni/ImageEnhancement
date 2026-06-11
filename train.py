@@ -21,8 +21,8 @@ def parse_args():
     parser.add_argument('--model', type=str, default='compact', choices=['compact', 'attention'])
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--use_transposed_conv', action='store_true')
-    parser.add_argument('--use_vgg_loss', action='store_true', help="Applica la Perceptual (VGG) Loss per mitigare l'over-smoothing")
-    parser.add_argument('--vgg_weight', type=float, default=0.1, help="Peso applicato alla VGG Loss")
+    parser.add_argument('--use_vgg_loss', action='store_true')
+    parser.add_argument('--vgg_weight', type=float, default=0.1)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=3e-4)
     return parser.parse_args()
@@ -41,16 +41,18 @@ def set_seed(seed=42):
 
 
 class VGGLoss(nn.Module):
+    """"
+    VGG-based perceptual loss. This loss computes the L1 distance between the feature maps of the output 
+    and target images extracted from a pre-trained VGG16 network. The feature maps are taken from the first 
+    16 layers of the VGG16 model, which capture low-level features such as edges and textures.
+    """
     def __init__(self, device):
         super(VGGLoss, self).__init__()
-        # Carica VGG-16 pre-addestrata su ImageNet
         vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features
-        # Estrae i layer fino a relu3_3 (indice 16)
         self.slice = nn.Sequential()
         for x in range(16):
             self.slice.add_module(str(x), vgg[x])
         self.slice.to(device).eval()
-        # Congela i pesi
         for param in self.slice.parameters():
             param.requires_grad = False
         self.criterion = nn.L1Loss()
@@ -90,6 +92,7 @@ def train_one_epoch(model, dataloader, optimizer, l1_criterion, ssim_criterion, 
         loss = alpha * l1_loss + beta * ssim_loss_val
 
         if vgg_criterion is not None:
+            # Compute VGG perceptual loss and add it to the total loss, weighted by vgg_weight
             vgg_loss_val = vgg_criterion(output, high)
             loss += vgg_weight * vgg_loss_val
 
@@ -163,7 +166,6 @@ def main():
 
     l1_criterion = nn.L1Loss()
     ssim_criterion = SSIMLoss()
-
     vgg_criterion = VGGLoss(device) if args.use_vgg_loss else None
 
     best_psnr = 0.0
