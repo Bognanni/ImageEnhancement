@@ -157,7 +157,7 @@ def main():
     else:
         model = CompactUNet(bilinear=bilinear_flag).to(device)
 
-    # Optimizer e Scheduler
+    # Optimizer and Scheduler
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     # The Cosine Annealing learning rate scheduler is used to adjust the learning rate during training. 
     # It starts with the initial learning rate and gradually decreases it following a cosine curve 
